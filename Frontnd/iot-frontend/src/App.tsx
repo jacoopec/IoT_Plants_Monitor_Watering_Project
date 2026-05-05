@@ -355,11 +355,26 @@ function metricDomain(
       return [baseMin, baseMax] as const;
     }
 
-    const min = Math.min(baseMin, ...allValues);
-    const max = Math.max(baseMax, ...allValues);
-    const padding = Math.max((max - min) * 0.08, 1);
+    const dataMin = Math.min(...allValues);
+    const dataMax = Math.max(...allValues);
+    const baseSpan = baseMax - baseMin;
+    const dataSpan = Math.max(dataMax - dataMin, baseSpan * 0.08, 1);
+    const padding = dataSpan * 0.18;
+    let min = dataMin - padding;
+    let max = dataMax + padding;
 
-    return [min - padding, max + padding] as const;
+    if (dataMin >= baseMin && dataMax <= baseMax) {
+      min = Math.max(baseMin, min);
+      max = Math.min(baseMax, max);
+    }
+
+    if (max - min < dataSpan) {
+      const center = (max + min) / 2;
+      min = center - dataSpan / 2;
+      max = center + dataSpan / 2;
+    }
+
+    return [min, max] as const;
   }
 
 function TrendChart({metric,predictionSteps,predictions,readings,}: {
@@ -368,13 +383,14 @@ function TrendChart({metric,predictionSteps,predictions,readings,}: {
     predictions: number[];
     readings: PlantReading[];
   }) {
-    const visibleReadings = readings.slice(-(predictionSteps + 1));
+    const visibleReadings = readings.slice(-HISTORY_LIMIT);
     const values = visibleReadings.map((reading) => reading[metric.key]);
     const latestValue = values.filter((value) => value !== null).at(-1) ?? null;
+    const shownPredictions = predictions.slice(0, predictionSteps);
     const anchoredPredictionValues =
       latestValue === null
         ? []
-        : [latestValue, ...predictions.slice(0, predictionSteps)];
+        : [latestValue, ...shownPredictions];
     const [minY, maxY] = metricDomain(
       values,
       anchoredPredictionValues,
@@ -387,7 +403,7 @@ function TrendChart({metric,predictionSteps,predictions,readings,}: {
     const padTop = 22;
     const padBottom = 54;
     const latestIndex = Math.max(values.length - 1, 0);
-    const totalSteps = Math.max(latestIndex + predictions.length, 1);
+    const totalSteps = Math.max(latestIndex + shownPredictions.length, 1);
 
     const toX = (index: number) =>
       padLeft + (index / totalSteps) * (chartWidth - padLeft - padRight);
@@ -417,7 +433,7 @@ function TrendChart({metric,predictionSteps,predictions,readings,}: {
         label: index === latestIndex ? "current" : String(index - latestIndex),
         isCurrent: index === latestIndex,
       })),
-      ...predictions.slice(0, predictionSteps).map((_value, index) => ({
+      ...shownPredictions.map((_value, index) => ({
         x: toX(latestIndex + index + 1),
         label: `+${index + 1}`,
         isCurrent: false,
@@ -528,7 +544,9 @@ function TrendChart({metric,predictionSteps,predictions,readings,}: {
               className="legend predicted"
               style={{ background: metric.predictionColor }}
             />
-            {predictions.length > 0 ? "backend prediction" : "waiting for API"}
+            {shownPredictions.length > 0
+              ? `backend prediction (${shownPredictions.length}/${predictionSteps} steps)`
+              : "waiting for API"}
           </span>
         </div>
       </article>
@@ -552,6 +570,14 @@ function App() {
     const latestReading = readings.at(-1) ?? null;
     const rows = useMemo(() => readings.slice(-8).reverse(), [readings]);
     const notices = [dataNotice, predictionNotice, paramsNotice].filter(Boolean);
+    const predictionRequestPath = useMemo(() => {
+      const searchParams = new URLSearchParams({
+        steps: String(predictionSteps),
+        algorithm: predictionAlgorithm,
+      });
+
+      return `/api/predictions?${searchParams.toString()}`;
+    }, [predictionAlgorithm, predictionSteps]);
 
     const handleParamChange = (
       key: keyof PlantParams,
@@ -625,11 +651,57 @@ function App() {
         }
       }
 
+      async function pollLatest() {
+        try {
+          const payload = await fetchJson<RawSensorReading & { message?: string }>(
+            "/api/latest",
+          );
+
+          if (payload.message) {
+            return;
+          }
+
+          const next = normalizeReading(payload);
+
+          if (next === null) {
+            return;
+          }
+
+          if (!cancelled) {
+            setReadings((current) => appendReading(current, next));
+            setFeedMode("live");
+            setDataNotice("");
+          }
+        } catch (error) {
+          console.error(error);
+
+          // if (!cancelled) {
+          //   setReadings((current) => {
+          //     const seed =
+          //       current.length > 0 ? current : createDemoHistory().slice(0, -1);
+          //     return appendReading(seed, createDemoReading(seed.at(-1)));
+          //   });
+          //   setFeedMode("demo");
+          //   setDataNotice("API unavailable. Showing generated sample readings.");
+          // }
+        }
+      }
+
+      loadHistory();
+      const interval = window.setInterval(pollLatest, POLL_INTERVAL_MS);
+
+      return () => {
+        cancelled = true;
+        window.clearInterval(interval);
+      };
+    }, []);
+
+    useEffect(() => {
+      let cancelled = false;
+
       async function fetchPredictions() {
         try {
-          const payload = await fetchJson<unknown>(
-            `/api/predictions?steps=${predictionSteps}&algorithm=${encodeURIComponent(predictionAlgorithm)}`,
-          );
+          const payload = await fetchJson<unknown>(predictionRequestPath);
           const normalized = normalizePredictions(payload, predictionSteps);
 
           if (!cancelled) {
@@ -648,54 +720,14 @@ function App() {
         }
       }
 
-    async function pollLatest() {
-      try {
-        const payload = await fetchJson<RawSensorReading & { message?: string }>(
-          "/api/latest",
-        );
-
-        if (payload.message) {
-          return;
-        }
-
-        const next = normalizeReading(payload);
-
-        if (next === null) {
-          return;
-        }
-
-        if (!cancelled) {
-          setReadings((current) => appendReading(current, next));
-          setFeedMode("live");
-          setDataNotice("");
-        }
-      } catch (error) {
-        console.error(error);
-
-        // if (!cancelled) {
-        //   setReadings((current) => {
-        //     const seed =
-        //       current.length > 0 ? current : createDemoHistory().slice(0, -1);
-        //     return appendReading(seed, createDemoReading(seed.at(-1)));
-        //   });
-        //   setFeedMode("demo");
-        //   setDataNotice("API unavailable. Showing generated sample readings.");
-        // }
-      }
-    }
-
-    loadHistory();
-    fetchPredictions();
-    const interval = window.setInterval(() => {
-      pollLatest();
       fetchPredictions();
-    }, POLL_INTERVAL_MS);
+      const interval = window.setInterval(fetchPredictions, POLL_INTERVAL_MS);
 
-    return () => {
-      cancelled = true;
-      window.clearInterval(interval);
-    };
-  }, [predictionAlgorithm, predictionSteps]);
+      return () => {
+        cancelled = true;
+        window.clearInterval(interval);
+      };
+    }, [predictionRequestPath, predictionSteps]);
 
   return (
     <main className="dashboard">

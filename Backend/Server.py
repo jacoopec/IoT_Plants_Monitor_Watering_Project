@@ -2,9 +2,10 @@ import json
 import random
 import threading
 from datetime import datetime, timezone
+from statistics import median
 from statsmodels.tsa.arima.model import ARIMA
 import paho.mqtt.client as mqtt
-from pymongo import MongoClient, DESCENDING
+from pymongo import MongoClient, ASCENDING, DESCENDING
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -20,11 +21,17 @@ from prophet import Prophet
 MONGO_URI = "mongodb://localhost:27017"
 MONGO_DB_NAME = "iot_project"
 MONGO_COLLECTION_NAME = "sensor_data"
+PREDICTION_MONGO_URI = "mongodb://localhost:27017/"
+PREDICTION_DATABASE_NAME = "sensor_database"
+PREDICTION_COLLECTION_NAME = "environment_data"
 
 
 mongo_client = MongoClient(MONGO_URI)
+prediction_mongo_client = MongoClient(PREDICTION_MONGO_URI)
 db = mongo_client[MONGO_DB_NAME]
 sensor_collection = db[MONGO_COLLECTION_NAME]
+prediction_db = prediction_mongo_client[PREDICTION_DATABASE_NAME]
+prediction_collection = prediction_db[PREDICTION_COLLECTION_NAME]
 
 
 # -----------------------------
@@ -68,6 +75,11 @@ METRIC_FIELD_NAMES = {
     "moisture": "moisture",
     "humidity": "humidity"
 }
+
+prediction_model_lock = threading.Lock()
+prediction_models = {}
+prediction_cache = {}
+prediction_training_error = None
 
 
 def newest_documents(limit):
@@ -258,138 +270,371 @@ def get_latest_sensor_data():
 
 
 
-def predict_arima(values, steps, order=(1, 1, 1)):
-    """
-    Forecast future values using ARIMA.
+def read_timestamp(value):
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
 
-    values: list of historical sensor values
-    steps: number of future values to predict
-    order: ARIMA(p, d, q), default is (1, 1, 1)
-    """
+        return value.astimezone(timezone.utc)
 
-    if steps <= 0 or not values:
-        return []
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
 
-    if len(values) == 1:
-        return [round(values[0], 2) for _ in range(steps)]
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=timezone.utc)
 
-    # ARIMA needs enough data to fit reliably.
-    # If too few values are available, use a simple fallback.
+            return parsed.astimezone(timezone.utc)
+        except ValueError:
+            return None
+
+    return None
+
+
+def load_prediction_training_series():
+    series = {
+        key: {
+            "timestamps": [],
+            "values": [],
+        }
+        for key in METRIC_FIELD_NAMES
+    }
+
+    documents = prediction_collection.find().sort([
+        ("timestamp", ASCENDING),
+        ("_id", ASCENDING),
+    ])
+
+    for document in documents:
+        timestamp = read_timestamp(document.get("timestamp"))
+
+        for key, field_name in METRIC_FIELD_NAMES.items():
+            value = read_numeric_field(document, [field_name])
+
+            if value is None:
+                continue
+
+            series[key]["timestamps"].append(timestamp)
+            series[key]["values"].append(value)
+
+    return series
+
+
+def collect_training_series(documents):
+    series = {
+        key: {
+            "timestamps": [],
+            "values": [],
+        }
+        for key in METRIC_FIELD_NAMES
+    }
+
+    latest_marker = "empty"
+
+    for document in documents:
+        latest_marker = str(document.get("_id", latest_marker))
+        timestamp = read_timestamp(document.get("timestamp"))
+
+        for key, field_name in METRIC_FIELD_NAMES.items():
+            value = read_numeric_field(document, [field_name])
+
+            if value is None:
+                continue
+
+            series[key]["timestamps"].append(timestamp)
+            series[key]["values"].append(value)
+
+    return series, latest_marker
+
+
+def has_training_values(series):
+    return any(
+        len(metric_series["values"]) >= 2
+        for metric_series in series.values()
+    )
+
+
+def recent_documents_from(collection, sort_fields, limit):
+    documents = list(
+        collection
+        .find()
+        .sort(sort_fields)
+        .limit(limit)
+    )
+    documents.reverse()
+
+    return documents
+
+
+def load_recent_prediction_training_series(limit):
+    live_documents = recent_documents_from(
+        sensor_collection,
+        [
+            ("received_at", DESCENDING),
+            ("timestamp", DESCENDING),
+            ("_id", DESCENDING),
+        ],
+        limit,
+    )
+    live_series, live_marker = collect_training_series(live_documents)
+
+    if has_training_values(live_series):
+        return live_series, {
+            "source": f"{MONGO_DB_NAME}.{MONGO_COLLECTION_NAME}",
+            "marker": live_marker,
+        }
+
+    historical_documents = recent_documents_from(
+        prediction_collection,
+        [
+            ("timestamp", DESCENDING),
+            ("_id", DESCENDING),
+        ],
+        limit,
+    )
+    historical_series, historical_marker = collect_training_series(
+        historical_documents
+    )
+
+    return historical_series, {
+        "source": f"{PREDICTION_DATABASE_NAME}.{PREDICTION_COLLECTION_NAME}",
+        "marker": historical_marker,
+    }
+
+
+def normalize_prophet_dates(timestamps, value_count):
+    valid_timestamps = [
+        timestamp
+        for timestamp in timestamps
+        if timestamp is not None
+    ]
+
+    if len(valid_timestamps) == value_count:
+        dates = pd.to_datetime(valid_timestamps, utc=True)
+        return pd.DatetimeIndex(dates).tz_convert(None)
+
+    return pd.date_range(
+        start="2024-01-01",
+        periods=value_count,
+        freq=infer_prophet_frequency(timestamps),
+    )
+
+
+def infer_prophet_frequency(timestamps):
+    valid_timestamps = sorted(
+        timestamp
+        for timestamp in timestamps
+        if timestamp is not None
+    )
+
+    if len(valid_timestamps) < 2:
+        return "10s"
+
+    deltas = [
+        (valid_timestamps[index] - valid_timestamps[index - 1]).total_seconds()
+        for index in range(1, len(valid_timestamps))
+    ]
+    seconds = max(1, int(round(median(deltas))))
+
+    return f"{seconds}s"
+
+
+def train_arima_model(values, order=(1, 1, 1)):
+    latest = values[-1] if values else None
+
     if len(values) < 8:
-        latest = values[-1]
-        return [round(latest, 2) for _ in range(steps)]
+        return {
+            "kind": "repeat_latest",
+            "latest": latest,
+        }
 
     try:
-        model = ARIMA(values, order=order)
-        fitted_model = model.fit()
+        model = ARIMA(values, order=order, trend="t")
+        return {
+            "kind": "arima",
+            "model": model.fit(),
+            "latest": latest,
+        }
+    except Exception as error:
+        print(f"ARIMA training failed: {error}")
+        return {
+            "kind": "repeat_latest",
+            "latest": latest,
+        }
 
-        forecast = fitted_model.forecast(steps=steps)
 
+def forecast_arima_model(model_data, steps):
+    if steps <= 0 or model_data.get("latest") is None:
+        return []
+
+    if model_data.get("kind") != "arima":
+        return [round(model_data["latest"], 2) for _step in range(steps)]
+
+    try:
+        forecast = model_data["model"].forecast(steps=steps)
         return [round(float(value), 2) for value in forecast]
+    except Exception as error:
+        print(f"ARIMA prediction failed: {error}")
+        return [round(model_data["latest"], 2) for _step in range(steps)]
 
-    except Exception as e:
-        print(f"ARIMA prediction failed: {e}")
 
-        # Safe fallback: repeat latest value
-        latest = values[-1]
-        return [round(latest, 2) for _ in range(steps)]
+def train_prophet_model(values, timestamps):
+    latest = values[-1] if values else None
 
-def predict_prophet(values, steps):
-    if steps <= 0 or not values:
+    if len(values) < 2:
+        return {
+            "kind": "repeat_latest",
+            "latest": latest,
+        }
+
+    try:
+        dates = normalize_prophet_dates(timestamps, len(values))
+        df = pd.DataFrame({
+            "ds": dates,
+            "y": values,
+        })
+        model = Prophet(
+            daily_seasonality=False,
+            weekly_seasonality=False,
+            yearly_seasonality=False,
+        )
+        model.fit(df)
+
+        return {
+            "kind": "prophet",
+            "model": model,
+            "frequency": infer_prophet_frequency(timestamps),
+            "last_date": df["ds"].iloc[-1],
+            "latest": latest,
+        }
+    except Exception as error:
+        print(f"Prophet training failed: {error}")
+        return {
+            "kind": "repeat_latest",
+            "latest": latest,
+        }
+
+
+def forecast_prophet_model(model_data, steps):
+    if steps <= 0 or model_data.get("latest") is None:
         return []
 
-    if len(values) == 1:
-        return [round(values[0], 2) for _ in range(steps)]
+    if model_data.get("kind") != "prophet":
+        return [round(model_data["latest"], 2) for _step in range(steps)]
 
- 
+    try:
+        future_dates = pd.date_range(
+            start=model_data["last_date"],
+            periods=steps + 1,
+            freq=model_data["frequency"],
+        )[1:]
+        forecast = model_data["model"].predict(pd.DataFrame({"ds": future_dates}))
 
-    # Prophet requires columns named ds and y
-    df = pd.DataFrame({
-        "ds": pd.date_range(start="2024-01-01", periods=len(values), freq="D"),
-        "y": values
-    })
+        return [
+            round(float(value), 2)
+            for value in forecast["yhat"]
+        ]
+    except Exception as error:
+        print(f"Prophet prediction failed: {error}")
+        return [round(model_data["latest"], 2) for _step in range(steps)]
 
-    model = Prophet(
-        daily_seasonality=False,
-        weekly_seasonality=False,
-        yearly_seasonality=False
-    )
 
-    model.fit(df)
+def train_least_squares_model(values):
+    latest = values[-1] if values else None
 
-    future = model.make_future_dataframe(periods=steps, freq="D")
-    forecast = model.predict(future)
+    if len(values) < 2:
+        return {
+            "intercept": latest if latest is not None else 0,
+            "latest": latest,
+            "slope": 0,
+            "value_count": len(values),
+        }
 
-    predictions = forecast["yhat"].tail(steps)
-
-    return [
-        round(value, 2)
-        for value in predictions
-    ]
-
-def predict_least_squares(values, steps):
-
-    if steps <= 0 or not values:
-        return []
-
-    if len(values) == 1:
-        return [round(values[0], 2) for _ in range(steps)]
-
-    recent_values = values[-8:]
-    mean_x = (len(recent_values) - 1) / 2
-    mean_y = sum(recent_values) / len(recent_values)
-    
+    mean_x = (len(values) - 1) / 2
+    mean_y = sum(values) / len(values)
     numerator = sum(
         (index - mean_x) * (value - mean_y)
-        for index, value in enumerate(recent_values)
+        for index, value in enumerate(values)
     )
-    
     denominator = sum(
         (index - mean_x) ** 2
-        for index, _value in enumerate(recent_values)
+        for index, _value in enumerate(values)
     )
-    
+
     slope = numerator / denominator if denominator else 0
-    latest = recent_values[-1]
+
+    return {
+        "intercept": mean_y - slope * mean_x,
+        "latest": latest,
+        "slope": slope,
+        "value_count": len(values),
+    }
+
+
+def forecast_least_squares_model(model_data, steps):
+    latest = model_data.get("latest")
+
+    if steps <= 0 or latest is None:
+        return []
 
     return [
-        round(latest + slope * (step + 1), 2)
+        round(latest + model_data["slope"] * (step + 1), 2)
         for step in range(steps)
     ]
+
+
+def least_squares_value_at(model_data, index):
+    if model_data.get("latest") is None:
+        return 0
+
+    if "intercept" in model_data:
+        return model_data["intercept"] + model_data["slope"] * index
+
+    value_count = model_data.get("value_count", 1)
+    return model_data["latest"] + model_data["slope"] * (
+        index - value_count + 1
+    )
 
 
 def mean_value(values):
     return sum(values) / len(values) if values else 0
 
 
-def sum_squared_error(values):
-    if not values:
-        return 0
-
-    mean = mean_value(values)
-    return sum((value - mean) ** 2 for value in values)
-
-
 def build_regression_tree(samples, depth=0, max_depth=3, min_leaf_size=2):
+    samples = sorted(samples, key=lambda sample: sample[0])
     values = [sample[1] for sample in samples]
 
     if depth >= max_depth or len(samples) <= min_leaf_size * 2:
         return {"value": mean_value(values)}
 
-    samples = sorted(samples, key=lambda sample: sample[0])
+    prefix_sum = [0]
+    prefix_square_sum = [0]
+
+    for value in values:
+        prefix_sum.append(prefix_sum[-1] + value)
+        prefix_square_sum.append(prefix_square_sum[-1] + value ** 2)
+
+    def range_squared_error(start, end):
+        count = end - start
+
+        if count <= 0:
+            return 0
+
+        total = prefix_sum[end] - prefix_sum[start]
+        square_total = prefix_square_sum[end] - prefix_square_sum[start]
+
+        return square_total - (total ** 2 / count)
+
     best_index = None
     best_loss = None
 
     for index in range(min_leaf_size, len(samples) - min_leaf_size + 1):
-        left_samples = samples[:index]
-        right_samples = samples[index:]
-
-        if left_samples[-1][0] == right_samples[0][0]:
+        if samples[index - 1][0] == samples[index][0]:
             continue
 
         loss = (
-            sum_squared_error([sample[1] for sample in left_samples])
-            + sum_squared_error([sample[1] for sample in right_samples])
+            range_squared_error(0, index)
+            + range_squared_error(index, len(samples))
         )
 
         if best_loss is None or loss < best_loss:
@@ -400,8 +645,8 @@ def build_regression_tree(samples, depth=0, max_depth=3, min_leaf_size=2):
         return {"value": mean_value(values)}
 
     threshold = (samples[best_index - 1][0] + samples[best_index][0]) / 2
-    left_samples = [sample for sample in samples if sample[0] <= threshold]
-    right_samples = [sample for sample in samples if sample[0] > threshold]
+    left_samples = samples[:best_index]
+    right_samples = samples[best_index:]
 
     if not left_samples or not right_samples:
         return {"value": mean_value(values)}
@@ -433,51 +678,114 @@ def predict_regression_tree(tree, index):
     return predict_regression_tree(tree["right"], index)
 
 
-def predict_decision_tree(values, steps):
-    if steps <= 0 or not values:
-        return []
+def train_decision_tree_model(values):
+    baseline = train_least_squares_model(values)
 
     if len(values) < 4:
-        return predict_least_squares(values, steps)
+        return {
+            "kind": "least_square",
+            "model": baseline,
+        }
 
-    samples = [(index, float(value)) for index, value in enumerate(values)]
-    tree = build_regression_tree(samples)
+    samples = [
+        (
+            index,
+            float(value) - least_squares_value_at(baseline, index),
+        )
+        for index, value in enumerate(values)
+    ]
+
+    return {
+        "kind": "tree",
+        "baseline": baseline,
+        "tree": build_regression_tree(samples),
+        "value_count": len(values),
+    }
+
+
+def forecast_decision_tree_model(model_data, steps):
+    if steps <= 0:
+        return []
+
+    if model_data.get("kind") != "tree":
+        return forecast_least_squares_model(model_data["model"], steps)
+
+    value_count = model_data["value_count"]
 
     return [
-        round(float(predict_regression_tree(tree, len(values) + step)), 2)
+        round(
+            least_squares_value_at(model_data["baseline"], value_count + step)
+            + float(
+                predict_regression_tree(
+                    model_data["tree"],
+                    value_count + step,
+                )
+            ),
+            2,
+        )
         for step in range(steps)
     ]
 
 
-def predict_random_forest(values, steps, tree_count=25):
-    if steps <= 0 or not values:
-        return []
+def train_random_forest_model(values, tree_count=25):
+    baseline = train_least_squares_model(values)
 
     if len(values) < 4:
-        return predict_least_squares(values, steps)
+        return {
+            "kind": "least_square",
+            "model": baseline,
+        }
 
-    samples = [(index, float(value)) for index, value in enumerate(values)]
+    samples = [
+        (
+            index,
+            float(value) - least_squares_value_at(baseline, index),
+        )
+        for index, value in enumerate(values)
+    ]
     min_leaf_size = max(1, min(4, len(samples) // 6))
-    random_source = random.Random(len(values) * 1009 + steps)
-    forecasts = []
+    random_source = random.Random(len(values) * 1009)
+    trees = []
 
     for tree_index in range(tree_count):
         bootstrap_samples = [
             random_source.choice(samples)
             for _sample in samples
         ]
-        tree = build_regression_tree(
+        trees.append(build_regression_tree(
             bootstrap_samples,
             max_depth=2 + (tree_index % 3),
             min_leaf_size=min_leaf_size,
-        )
-        forecasts.append([
-            predict_regression_tree(tree, len(values) + step)
-            for step in range(steps)
-        ])
+        ))
+
+    return {
+        "kind": "forest",
+        "baseline": baseline,
+        "trees": trees,
+        "value_count": len(values),
+    }
+
+
+def forecast_random_forest_model(model_data, steps):
+    if steps <= 0:
+        return []
+
+    if model_data.get("kind") != "forest":
+        return forecast_least_squares_model(model_data["model"], steps)
+
+    trees = model_data["trees"]
+    value_count = model_data["value_count"]
 
     return [
-        round(sum(forecast[step] for forecast in forecasts) / len(forecasts), 2)
+        round(
+            least_squares_value_at(model_data["baseline"], value_count + step)
+            +
+            sum(
+                predict_regression_tree(tree, value_count + step)
+                for tree in trees
+            ) / len(trees),
+            2,
+        )
         for step in range(steps)
     ]
 
@@ -499,45 +807,206 @@ def normalize_prediction_algorithm(algorithm):
     return aliases.get(normalized, "least_square")
 
 
-def predict_values(values, steps, algorithm):
+def train_metric_models(values, timestamps):
+    return {
+        "value_count": len(values),
+        "models": {
+            "least_square": train_least_squares_model(values),
+            "arima": train_arima_model(values),
+            "prophet": train_prophet_model(values, timestamps),
+            "decision_tree": train_decision_tree_model(values),
+            "random_forest": train_random_forest_model(values),
+        },
+    }
+
+
+def train_prediction_model(values, timestamps, algorithm):
     if algorithm == "arima":
-        return predict_arima(values, steps)
+        return train_arima_model(values)
 
     if algorithm == "prophet":
-        return predict_prophet(values, steps)
+        return train_prophet_model(values, timestamps)
 
     if algorithm == "decision_tree":
-        return predict_decision_tree(values, steps)
+        return train_decision_tree_model(values)
 
     if algorithm == "random_forest":
-        return predict_random_forest(values, steps)
+        return train_random_forest_model(values)
 
-    return predict_least_squares(values, steps)
+    return train_least_squares_model(values)
+
+
+def train_metric_model(values, timestamps, algorithm):
+    models = {
+        algorithm: train_prediction_model(values, timestamps, algorithm),
+    }
+
+    if algorithm != "least_square":
+        models["least_square"] = train_least_squares_model(values)
+
+    return {
+        "value_count": len(values),
+        "models": models,
+    }
+
+
+def train_prediction_models_for_series(training_series, algorithm):
+    trained_models = {}
+
+    for metric_key, metric_series in training_series.items():
+        trained_models[metric_key] = train_metric_model(
+            metric_series["values"],
+            metric_series["timestamps"],
+            algorithm,
+        )
+
+    return trained_models
+
+
+def train_prediction_models():
+    global prediction_models, prediction_training_error
+
+    try:
+        training_series = load_prediction_training_series()
+        trained_models = {}
+
+        for metric_key, metric_series in training_series.items():
+            values = metric_series["values"]
+            timestamps = metric_series["timestamps"]
+            trained_models[metric_key] = train_metric_models(values, timestamps)
+
+        with prediction_model_lock:
+            prediction_models = trained_models
+            prediction_training_error = None
+
+        counts = {
+            metric_key: metric_models["value_count"]
+            for metric_key, metric_models in trained_models.items()
+        }
+        print(
+            "Prediction models trained from "
+            f"{PREDICTION_DATABASE_NAME}.{PREDICTION_COLLECTION_NAME}: {counts}"
+        )
+    except Exception as error:
+        with prediction_model_lock:
+            prediction_models = {}
+            prediction_training_error = str(error)
+
+        print(f"Prediction model training failed: {error}")
+
+
+def forecast_trained_values(metric_models, steps, algorithm):
+    if metric_models is None or metric_models.get("value_count", 0) == 0:
+        return []
+
+    model_data = metric_models["models"].get(algorithm)
+
+    if model_data is None:
+        model_data = metric_models["models"]["least_square"]
+        algorithm = "least_square"
+
+    if algorithm == "arima":
+        return forecast_arima_model(model_data, steps)
+
+    if algorithm == "prophet":
+        return forecast_prophet_model(model_data, steps)
+
+    if algorithm == "decision_tree":
+        return forecast_decision_tree_model(model_data, steps)
+
+    if algorithm == "random_forest":
+        return forecast_random_forest_model(model_data, steps)
+
+    return forecast_least_squares_model(model_data, steps)
+
+
+@app.on_event("startup")
+def train_prediction_models_on_startup():
+    global prediction_training_error
+
+    try:
+        training_series, training_metadata = load_recent_prediction_training_series(28)
+        default_algorithm = "least_square"
+        trained_models = train_prediction_models_for_series(
+            training_series,
+            default_algorithm,
+        )
+        cache_key = (
+            training_metadata["source"],
+            training_metadata["marker"],
+            28,
+            default_algorithm,
+        )
+
+        with prediction_model_lock:
+            prediction_cache[cache_key] = trained_models
+            prediction_training_error = None
+
+        counts = {
+            metric_key: metric_models["value_count"]
+            for metric_key, metric_models in trained_models.items()
+        }
+        print(
+            "Prediction cache warmed from "
+            f"{training_metadata['source']}: {counts}"
+        )
+    except Exception as error:
+        with prediction_model_lock:
+            prediction_training_error = str(error)
+
+        print(f"Prediction cache warmup failed: {error}")
 
 
 @app.get("/api/predictions")
 def get_predictions(steps: int = 10, limit: int = 28, algorithm: str = "least square"):
     steps = max(0, min(steps, 100))
-    limit = max(2, min(limit, 500))
+    limit = max(4, min(limit, 500))
     prediction_algorithm = normalize_prediction_algorithm(algorithm)
-    documents = list(newest_documents(limit))
-    documents.reverse()
+    training_series, training_metadata = load_recent_prediction_training_series(limit)
+    cache_key = (
+        training_metadata["source"],
+        training_metadata["marker"],
+        limit,
+        prediction_algorithm,
+    )
 
-    metric_values = {key: [] for key in METRIC_FIELD_NAMES}
+    with prediction_model_lock:
+        cached_models = prediction_cache.get(cache_key)
 
-    for doc in documents:
-        for key, field_name in METRIC_FIELD_NAMES.items():
-            value = read_numeric_field(doc, [field_name])
+    if cached_models is None:
+        try:
+            cached_models = train_prediction_models_for_series(
+                training_series,
+                prediction_algorithm,
+            )
+        except Exception as error:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Prediction models are not available: {error}",
+            ) from error
 
-            if value is not None:
-                metric_values[key].append(value)
+        with prediction_model_lock:
+            prediction_cache.clear()
+            prediction_cache[cache_key] = cached_models
 
-    response = {
-        key: predict_values(values, steps, prediction_algorithm)
-        for key, values in metric_values.items()
+    predictions = {
+        key: forecast_trained_values(
+            cached_models.get(key),
+            steps,
+            prediction_algorithm,
+        )
+        for key in METRIC_FIELD_NAMES
     }
 
-    return response
+    return {
+        "algorithm": prediction_algorithm,
+        "source": training_metadata["source"],
+        "training_counts": {
+            key: len(metric_series["values"])
+            for key, metric_series in training_series.items()
+        },
+        "predictions": predictions,
+    }
 
 
 class UpdateParams(BaseModel):
